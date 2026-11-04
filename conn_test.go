@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"math/rand"
 	"net"
 	"reflect"
 	"sync"
@@ -693,4 +694,40 @@ func TestFailedConnectionReadPanic(t *testing.T) {
 		c.ReadMessage()
 	}
 	t.Fatal("should not get here")
+}
+
+// TestMaskKeyNotPredictable checks that client frame mask keys are not taken
+// from the math/rand global source. Mask keys predictable from that source let
+// an attacker who controls the payload choose the bytes put on the wire.
+func TestMaskKeyNotPredictable(t *testing.T) {
+	const numFrames = 4
+	payload := []byte("hello")
+
+	// Mask keys an attacker would predict from the math/rand global source.
+	rand.Seed(1234)
+	var predicted []byte
+	for i := 0; i < numFrames; i++ {
+		n := rand.Uint32()
+		predicted = append(predicted, byte(n), byte(n>>8), byte(n>>16), byte(n>>24))
+	}
+
+	var buf bytes.Buffer
+	c := newTestConn(nil, &buf, false)
+	rand.Seed(1234)
+	var got []byte
+	for i := 0; i < numFrames; i++ {
+		buf.Reset()
+		if err := c.WriteMessage(BinaryMessage, payload); err != nil {
+			t.Fatal(err)
+		}
+		frame := buf.Bytes()
+		if len(frame) != 2+4+len(payload) || frame[1]&maskBit == 0 {
+			t.Fatalf("unexpected client frame % x", frame)
+		}
+		got = append(got, frame[2:6]...)
+	}
+
+	if bytes.Equal(got, predicted) {
+		t.Fatal("client frame mask keys are predictable from the math/rand global source")
+	}
 }
