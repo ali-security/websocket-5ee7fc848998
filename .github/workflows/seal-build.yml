@@ -1,0 +1,118 @@
+# Authored by agentic-sealer: gorilla/websocket v1.5.0 has no GitHub Actions CI
+# (upstream CI is .circleci/config.yml). This workflow translates that CircleCI
+# matrix (`go test -v -race ./...` on Go 1.11-1.17) and builds the module zip
+# exactly as proxy.golang.org serves it.
+name: seal-build
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Space-separated test names to run (empty = full suite)"
+        required: false
+        default: ""
+
+jobs:
+  module-zip:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.x"
+          cache: false
+      - name: Build x/mod zip helper (outside the module tree)
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/helper"
+          cd "$RUNNER_TEMP/helper"
+          cat > main.go <<'EOF'
+          package main
+
+          import (
+              "log"
+              "os"
+
+              "golang.org/x/mod/module"
+              "golang.org/x/mod/zip"
+          )
+
+          func main() {
+              if len(os.Args) != 5 {
+                  log.Fatal("usage: helper <module-path> <version> <dir> <out.zip>")
+              }
+              f, err := os.Create(os.Args[4])
+              if err != nil {
+                  log.Fatal(err)
+              }
+              defer f.Close()
+              mv := module.Version{Path: os.Args[1], Version: os.Args[2]}
+              if err := zip.CreateFromDir(f, mv, os.Args[3]); err != nil {
+                  log.Fatal(err)
+              }
+          }
+          EOF
+          go mod init sealhelper
+          go get golang.org/x/mod@v0.24.0
+          go build -o "$RUNNER_TEMP/create_mod_zip" .
+      - name: Create module zip from a pristine copy of the tree
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/modsrc" "$RUNNER_TEMP/out"
+          cp -r "$GITHUB_WORKSPACE/." "$RUNNER_TEMP/modsrc/"
+          rm -rf "$RUNNER_TEMP/modsrc/.git"
+          # Drop only this sealing workflow; upstream's own .github files ship in the zip.
+          rm -f "$RUNNER_TEMP/modsrc/.github/workflows/seal-build.yml"
+          if [ -z "$(ls -A "$RUNNER_TEMP/modsrc/.github/workflows")" ]; then rmdir "$RUNNER_TEMP/modsrc/.github/workflows"; fi
+          "$RUNNER_TEMP/create_mod_zip" github.com/gorilla/websocket v1.5.0 "$RUNNER_TEMP/modsrc" "$RUNNER_TEMP/out/v1.5.0.zip"
+          unzip -l "$RUNNER_TEMP/out/v1.5.0.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: module-zip
+          path: ${{ runner.temp }}/out/v1.5.0.zip
+          if-no-files-found: error
+
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # Same versions as upstream .circleci/config.yml ("latest" at release time was 1.17).
+        go: ["1.17", "1.16", "1.15", "1.14", "1.13", "1.12", "1.11"]
+    env:
+      GO111MODULE: "on"
+      GOTOOLCHAIN: local
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+          cache: false
+      - name: Allow the pre-1.19 race detector (TSan) to map memory on ubuntu-24.04
+        shell: bash
+        run: sudo sysctl -w vm.mmap_rnd_bits=28
+      - name: Print the Go version
+        shell: bash
+        run: go version
+      - name: Fetch dependencies
+        shell: bash
+        run: go mod download
+      - name: Run go test (+ race detector)
+        shell: bash
+        env:
+          TEST_FILTER: ${{ inputs.test-filter }}
+        run: |
+          if [ -n "$TEST_FILTER" ]; then
+            RUN_RE="^($(echo "$TEST_FILTER" | tr -s ' ' '|'))\$"
+            echo "Running only: $RUN_RE"
+            go test -v -race -run "$RUN_RE" ./... 2>&1 | tee "$RUNNER_TEMP/test.log"
+          else
+            go test -v -race ./... 2>&1 | tee "$RUNNER_TEMP/test.log"
+          fi
+          echo "=== Test summary (Go ${{ matrix.go }}) ==="
+          echo "passed:  $(awk '/^ *--- PASS/{n++} END{print n+0}' "$RUNNER_TEMP/test.log")"
+          echo "failed:  $(awk '/^ *--- FAIL/{n++} END{print n+0}' "$RUNNER_TEMP/test.log")"
+          echo "skipped: $(awk '/^ *--- SKIP/{n++} END{print n+0}' "$RUNNER_TEMP/test.log")"
+          awk '/^ *--- SKIP/{print; getline; print}' "$RUNNER_TEMP/test.log"
